@@ -76,7 +76,24 @@ DEFAULT_SETTINGS = {
     "fsub_enabled": True,
     "fsub_channel_id": int(os.environ.get("FSUB_CHANNEL_ID", "0") or 0),
     "fsub_invite_link": os.environ.get("FSUB_INVITE_LINK", ""),
+    "welcome_text": None,    # None = use DEFAULT_WELCOME_TEXT
+    "fsub_join_text": None,  # None = use DEFAULT_FSUB_JOIN_TEXT
 }
+
+# Admin-editable via the Admin Panel's "📝 Messages" section, without a
+# redeploy. `get_message()` falls back to these whenever no override is
+# saved in MongoDB (or the override was reset).
+DEFAULT_WELCOME_TEXT = "This bot securely stores your files and lets you share them via links."
+DEFAULT_FSUB_JOIN_TEXT = "Please join our channel first, then tap **Verify** below to continue."
+EDITABLE_MESSAGES = {
+    "welcome_text": ("Welcome Message", DEFAULT_WELCOME_TEXT),
+    "fsub_join_text": ("FSUB Join Message", DEFAULT_FSUB_JOIN_TEXT),
+}
+
+
+def get_message(key):
+    conf = get_settings()
+    return conf.get(key) or EDITABLE_MESSAGES[key][1]
 
 
 def get_settings():
@@ -143,6 +160,38 @@ def is_banned(user_id):
 def get_expired_bans():
     now = datetime.utcnow()
     return [d["_id"] for d in banned_col.find({"expires_at": {"$ne": None, "$lte": now}})]
+
+
+async def _execute_ban(message, target, rest_text):
+    """Shared by /ban and the Admin Panel's Ban button. rest_text is
+    everything after the user_id, as one raw string (may be empty)."""
+    if is_admin(target):
+        await message.reply("🚫 Admins cannot be banned.")
+        return
+
+    expires_at = None
+    reason = None
+    rest_text = rest_text.strip()
+    if rest_text:
+        first_word, _, remainder = rest_text.partition(" ")
+        seconds = parse_duration(first_word)
+        if seconds is not None:
+            expires_at = datetime.utcnow() + timedelta(seconds=seconds)
+            reason = remainder.strip() or None
+        else:
+            reason = rest_text
+
+    ban_user(target, reason, expires_at)
+    reply = f"✅ User `{target}` has been banned."
+    reply += f"\n⏳ Auto-unban at: `{expires_at.isoformat()} UTC`" if expires_at else "\n⏳ Type: Permanent"
+    if reason:
+        reply += f"\nReason: {reason}"
+    await message.reply(reply)
+
+
+async def _execute_unban(message, target):
+    unban_user(target)
+    await message.reply(f"✅ User `{target}` has been unbanned.")
 
 
 def parse_duration(text):
@@ -311,7 +360,7 @@ async def start_handler(client, message: Message):
             ]
         )
         m2 = await message.reply(
-            "Please join our channel first, then tap **Verify** below to continue.",
+            get_message("fsub_join_text"),
             reply_markup=kb,
         )
         join_msgs[user_id] = [m1.id, m2.id]
@@ -368,7 +417,7 @@ async def deliver_start(client, chat_id, user_id, code):
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("❓ Help", callback_data="show_help")]])
     text = (
         "🪪 **Welcome to RoxieCloud!**\n\n"
-        "This bot securely stores your files and lets you share them via links.\n\n"
+        f"{get_message('welcome_text')}\n\n"
         f"{CREDIT_LINE}"
     )
     await client.send_message(chat_id, text, reply_markup=kb, disable_web_page_preview=True)
@@ -558,7 +607,11 @@ def admin_main_kb():
              InlineKeyboardButton("🐞 Debug", callback_data="adm_debug")],
             [InlineKeyboardButton("⚙️ Settings", callback_data="adm_settings"),
              InlineKeyboardButton("✏️ Edit", callback_data="adm_edit")],
-            [InlineKeyboardButton("🆔 GetId", callback_data="adm_getid_info"),
+            [InlineKeyboardButton("📝 Messages", callback_data="adm_messages"),
+             InlineKeyboardButton("🆔 GetId", callback_data="adm_getid_info")],
+            [InlineKeyboardButton("🚫 Ban / Unban", callback_data="adm_ban_menu"),
+             InlineKeyboardButton("📦 Batch", callback_data="adm_batch_info")],
+            [InlineKeyboardButton("🔒 Special Links", callback_data="adm_speciallink_info"),
              InlineKeyboardButton("❓ Help", callback_data="show_help")],
             [InlineKeyboardButton("❌ Exit", callback_data="adm_exit")],
         ]
@@ -682,21 +735,93 @@ async def admin_cb(client, cq: CallbackQuery):
         pending_edit[cq.from_user.id] = "fsub_link"
         await cq.message.edit_text("Please send the new FSUB invite link (e.g. `https://t.me/+xxxxxxxxxxxx`):")
 
+    elif data == "adm_messages":
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("✏️ Welcome Message", callback_data="adm_edit_msg_welcome_text")],
+                [InlineKeyboardButton("✏️ FSUB Join Message", callback_data="adm_edit_msg_fsub_join_text")],
+                [InlineKeyboardButton("🔙 Back", callback_data="adm_back")],
+            ]
+        )
+        await cq.message.edit_text("**📝 Messages**\n\nChoose a message to customize:", reply_markup=kb)
+
+    elif data.startswith("adm_edit_msg_"):
+        key = data[len("adm_edit_msg_"):]
+        pending_edit[cq.from_user.id] = key
+        label, _default = EDITABLE_MESSAGES[key]
+        current = get_message(key)
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🔄 Reset to Default", callback_data=f"adm_reset_msg_{key}")],
+                [InlineKeyboardButton("🔙 Cancel", callback_data="adm_messages")],
+            ]
+        )
+        await cq.message.edit_text(f"**{label}**\n\nCurrent text:\n{current}\n\nSend the new text to replace it:", reply_markup=kb)
+
+    elif data.startswith("adm_reset_msg_"):
+        key = data[len("adm_reset_msg_"):]
+        update_setting(key, None)
+        label, _default = EDITABLE_MESSAGES[key]
+        await cq.answer(f"{label} reset to default ✅")
+        await cq.message.edit_text(
+            f"✅ **{label}** has been reset to default.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="adm_messages")]]),
+        )
+
+    elif data == "adm_ban_menu":
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🚫 Ban User", callback_data="adm_ban_start")],
+                [InlineKeyboardButton("✅ Unban User", callback_data="adm_unban_start")],
+                [InlineKeyboardButton("🔙 Back", callback_data="adm_back")],
+            ]
+        )
+        await cq.message.edit_text("**Ban / Unban**\n\nChoose an action:", reply_markup=kb)
+
+    elif data == "adm_ban_start":
+        pending_edit[cq.from_user.id] = "ban_user"
+        await cq.message.edit_text(
+            "Send the details in one line:\n`<user_id> [duration] [reason]`\n\n"
+            "Duration is optional (`30m`, `2h`, `1d`) — omit it for a permanent ban.\n"
+            "Example: `123456789 2h spamming`"
+        )
+
+    elif data == "adm_unban_start":
+        pending_edit[cq.from_user.id] = "unban_user"
+        await cq.message.edit_text("Send the user ID to unban:")
+
+    elif data == "adm_batch_info":
+        await cq.message.edit_text(
+            "**📦 Batch Links**\n\n"
+            "Usage: `/batch <start_msg_id> <end_msg_id>`\n\n"
+            "Use the DB channel message IDs (shown when a file is uploaded, or via "
+            "Telegram's \"Copy Message Link\" on any message in the DB channel).\n\n"
+            f"Max files per batch: `{MAX_BATCH_SIZE}`",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]),
+        )
+
+    elif data == "adm_speciallink_info":
+        await cq.message.edit_text(
+            "**🔒 Special Links**\n\n" + SPECIAL_LINK_USAGE + "\n\nCheck status: `/speciallinkstats <link_or_token>`",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]),
+        )
+
     await cq.answer()
 
 
-@app.on_message(
-    filters.text
-    & filters.private
-    & filters.user(ADMIN_IDS)
-    & ~filters.command(["start", "admin", "broadcast", "getid", "ban", "unban", "batch", "speciallink", "speciallinkstats", "help"])
-)
+# Only matches when we're actually waiting for this admin's text input,
+# AND the message isn't itself a slash command (so if an admin changes
+# their mind mid-flow and runs a real command instead, it still reaches
+# that command's own handler instead of being swallowed as edit input).
+awaiting_edit_filter = filters.create(lambda _, __, m: bool(m.from_user) and m.from_user.id in pending_edit)
+not_command_filter = filters.create(lambda _, __, m: not (m.text and m.text.startswith("/")))
+
+
+@app.on_message(filters.text & filters.private & filters.user(ADMIN_IDS) & awaiting_edit_filter & not_command_filter)
 async def handle_admin_text(client, message: Message):
     admin_id = message.from_user.id
-    if admin_id not in pending_edit:
-        return
-
     action = pending_edit.pop(admin_id)
+
     if action == "fsub_id":
         try:
             new_id = int(message.text.strip())
@@ -704,9 +829,36 @@ async def handle_admin_text(client, message: Message):
             await message.reply(f"✅ FSUB Channel ID updated: `{new_id}`")
         except ValueError:
             await message.reply("❌ Invalid ID. It must be a numeric value, e.g. `-1001234567890`")
+
     elif action == "fsub_link":
         update_setting("fsub_invite_link", message.text.strip())
         await message.reply("✅ FSUB invite link updated.")
+
+    elif action == "welcome_text":
+        update_setting("welcome_text", message.text)
+        await message.reply("✅ Welcome message updated.")
+
+    elif action == "fsub_join_text":
+        update_setting("fsub_join_text", message.text)
+        await message.reply("✅ FSUB join message updated.")
+
+    elif action == "ban_user":
+        parts = message.text.split(None, 1)
+        try:
+            target = int(parts[0])
+        except (ValueError, IndexError):
+            await message.reply("The user ID must be numeric.")
+            return
+        rest_text = parts[1] if len(parts) > 1 else ""
+        await _execute_ban(message, target, rest_text)
+
+    elif action == "unban_user":
+        try:
+            target = int(message.text.strip())
+        except ValueError:
+            await message.reply("The user ID must be numeric.")
+            return
+        await _execute_unban(message, target)
 
 
 # ============================================================
@@ -773,7 +925,7 @@ async def getid_handler(client, message: Message):
 # ============================================================
 @app.on_message(filters.command("ban") & filters.private & filters.user(ADMIN_IDS))
 async def cmd_ban(client, message: Message):
-    parts = message.text.split(None, 3)
+    parts = message.text.split(None, 2)
     if len(parts) < 2:
         await message.reply(
             "Usage: `/ban <user_id> [duration] [reason]`\n"
@@ -785,27 +937,8 @@ async def cmd_ban(client, message: Message):
     except ValueError:
         await message.reply("The user ID must be numeric.")
         return
-    if is_admin(target):
-        await message.reply("🚫 Admins cannot be banned.")
-        return
-
-    expires_at = None
-    reason = None
-    if len(parts) >= 3:
-        seconds = parse_duration(parts[2])
-        if seconds is not None:
-            expires_at = datetime.utcnow() + timedelta(seconds=seconds)
-            if len(parts) == 4:
-                reason = parts[3]
-        else:
-            reason = message.text.split(None, 2)[2]
-
-    ban_user(target, reason, expires_at)
-    reply = f"✅ User `{target}` has been banned."
-    reply += f"\n⏳ Auto-unban at: `{expires_at.isoformat()} UTC`" if expires_at else "\n⏳ Type: Permanent"
-    if reason:
-        reply += f"\nReason: {reason}"
-    await message.reply(reply)
+    rest_text = parts[2] if len(parts) > 2 else ""
+    await _execute_ban(message, target, rest_text)
 
 
 @app.on_message(filters.command("unban") & filters.private & filters.user(ADMIN_IDS))
@@ -819,8 +952,7 @@ async def cmd_unban(client, message: Message):
     except ValueError:
         await message.reply("The user ID must be numeric.")
         return
-    unban_user(target)
-    await message.reply(f"✅ User `{target}` has been unbanned.")
+    await _execute_unban(message, target)
 
 
 # ============================================================

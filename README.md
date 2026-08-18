@@ -109,12 +109,16 @@ Limit poori hote hi link "invalid/expired" bata dega, original link pe koi asar 
 
 Pehle auto-delete timer bot ki memory mein chalta tha — Railway restart/redeploy pe pending deletes cancel ho jaate the. Ab ye MongoDB mein persist hota hai aur ek background sweeper (har 15 second) check karta hai, so restart ke baad bhi due deletions properly execute hoti hain.
 
-### Admin Panel features
+### Admin Panel features (ab sab kuch inline buttons se accessible hai)
 - **Broadcast** — reply-based broadcast, saare users ko msg jayega
 - **Debug** — `bot.log` se latest errors dikhata hai
 - **Settings** — Auto-delete timer (10s/30s/1m/5m/15m/30m/2h/OFF), Share on/off, Save on/off, FSUB on/off
 - **Edit** — FSUB channel ID / invite link change
+- **Messages** — Welcome message aur FSUB Join message ka text customize karo, reset-to-default ke saath (bina redeploy)
 - **GetId** — kisi bhi chat/user ki ID nikalna
+- **Ban / Unban** — button se ban/unban karo, ya `/ban` `/unban` command se
+- **Batch** — usage info dikhata hai (link `/batch <start> <end>` se banta hai — do numbers ek saath type karna easier hai command se)
+- **Special Links** — usage info dikhata hai (`/speciallink`/`/speciallinkstats` se banta hai)
 - **Exit** — panel band
 
 ---
