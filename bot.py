@@ -9,13 +9,14 @@ Stack: Pyrogram (MTProto, supports files up to 2GB) + MongoDB (persistent storag
 """
 
 import os
+import re
 import asyncio
 import logging
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
 from pyrogram.errors import UserNotParticipant, FloodWait, RPCError
 from pymongo import MongoClient
@@ -58,6 +59,14 @@ db = mongo["roxiecloud"]
 files_col = db["files"]
 users_col = db["users"]
 settings_col = db["settings"]
+banned_col = db["banned"]
+batch_col = db["batches"]
+special_links_col = db["special_links"]
+pending_deletions_col = db["pending_deletions"]
+
+MAX_BATCH_SIZE = int(os.environ.get("MAX_BATCH_SIZE", "50"))
+SPECIAL_PREFIX = "s_"
+BATCH_PREFIX = "b_"
 
 DEFAULT_SETTINGS = {
     "_id": "config",
@@ -84,7 +93,16 @@ def update_setting(key, value):
 
 def add_user(user_id):
     if not users_col.find_one({"_id": user_id}):
-        users_col.insert_one({"_id": user_id, "joined_at": datetime.utcnow()})
+        users_col.insert_one({"_id": user_id, "joined_at": datetime.utcnow(), "welcomed": False})
+
+
+def has_welcomed(user_id):
+    doc = users_col.find_one({"_id": user_id})
+    return bool(doc and doc.get("welcomed"))
+
+
+def mark_welcomed(user_id):
+    users_col.update_one({"_id": user_id}, {"$set": {"welcomed": True}}, upsert=True)
 
 
 def gen_code():
@@ -96,6 +114,125 @@ def gen_code():
 
 def is_admin(user_id):
     return user_id in ADMIN_IDS
+
+
+# ---- Ban system ----
+def ban_user(user_id, reason=None, expires_at=None):
+    banned_col.update_one(
+        {"_id": user_id},
+        {"$set": {"banned_at": datetime.utcnow(), "reason": reason, "expires_at": expires_at}},
+        upsert=True,
+    )
+
+
+def unban_user(user_id):
+    banned_col.delete_one({"_id": user_id})
+
+
+def is_banned(user_id):
+    doc = banned_col.find_one({"_id": user_id})
+    if not doc:
+        return False
+    expires_at = doc.get("expires_at")
+    if expires_at and expires_at <= datetime.utcnow():
+        unban_user(user_id)
+        return False
+    return True
+
+
+def get_expired_bans():
+    now = datetime.utcnow()
+    return [d["_id"] for d in banned_col.find({"expires_at": {"$ne": None, "$lte": now}})]
+
+
+def parse_duration(text):
+    """Parses '30', '30m', '2h', '1d' into a number of seconds. A bare
+    number (no suffix) is treated as minutes. Returns None if unparsable."""
+    m = re.match(r"^(\d+)\s*([mhd]?)$", text.strip().lower())
+    if not m:
+        return None
+    value, unit = m.groups()
+    value = int(value)
+    if value <= 0:
+        return None
+    return value * {"m": 60, "h": 3600, "d": 86400, "": 60}[unit]
+
+
+# ---- Batch links ----
+def gen_batch_code():
+    while True:
+        token = BATCH_PREFIX + secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:8]
+        if not batch_col.find_one({"_id": token}):
+            return token
+
+
+# ---- Special (view/time-limited) links ----
+def gen_special_token():
+    while True:
+        token = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:8]
+        if not special_links_col.find_one({"_id": token}):
+            return token
+
+
+def create_special_link(source_code, max_views=None, expires_at=None):
+    token = gen_special_token()
+    special_links_col.insert_one(
+        {
+            "_id": token,
+            "source_code": source_code,
+            "max_views": max_views,
+            "views_used": 0,
+            "expires_at": expires_at,
+            "created_at": datetime.utcnow(),
+            "revoked": False,
+        }
+    )
+    return token
+
+
+def claim_special_link(token):
+    """Atomically attempts to consume one view of a special link.
+    Returns (status, source_code): status is "ok", "revoked", "expired",
+    "limit_reached", or "invalid"."""
+    doc = special_links_col.find_one({"_id": token})
+    if not doc:
+        return "invalid", None
+    if doc.get("revoked"):
+        return "revoked", None
+    expires_at = doc.get("expires_at")
+    if expires_at and expires_at <= datetime.utcnow():
+        return "expired", None
+
+    max_views = doc.get("max_views")
+    if max_views is not None:
+        result = special_links_col.update_one(
+            {"_id": token, "views_used": {"$lt": max_views}}, {"$inc": {"views_used": 1}}
+        )
+        if result.modified_count == 0:
+            return "limit_reached", None
+        return "ok", doc["source_code"]
+
+    special_links_col.update_one({"_id": token}, {"$inc": {"views_used": 1}})
+    return "ok", doc["source_code"]
+
+
+def extract_code(raw):
+    """Admins often paste the whole link rather than just the code - pull
+    the code back out of a `?start=...` URL if that's what was given."""
+    raw = raw.strip()
+    if "start=" in raw:
+        raw = raw.split("start=", 1)[1]
+    return raw.split("&")[0].strip()
+
+
+# ---- Restart-safe auto-delete queue ----
+def schedule_deletion(chat_id, message_id, delay_seconds):
+    delete_at = datetime.utcnow() + timedelta(seconds=delay_seconds)
+    pending_deletions_col.update_one(
+        {"_id": f"{chat_id}:{message_id}"},
+        {"$set": {"chat_id": chat_id, "message_id": message_id, "delete_at": delete_at}},
+        upsert=True,
+    )
 
 
 # ============================================================
@@ -130,6 +267,11 @@ async def get_bot_username(client):
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message: Message):
     user_id = message.from_user.id
+
+    if is_banned(user_id):
+        await message.reply("🚫 You are banned from using this bot. Contact the administrator if you believe this is a mistake.")
+        return
+
     add_user(user_id)
 
     args = message.command
@@ -138,11 +280,13 @@ async def start_handler(client, message: Message):
     # Admin auto-recognized: skip FSUB entirely
     if is_admin(user_id):
         if code:
-            # Deliver the file directly - repeating the welcome card on every
-            # single file link would be redundant.
-            await send_file_by_code(client, message.chat.id, code)
-        else:
+            await deliver_code(client, message.chat.id, code)
+        elif not has_welcomed(user_id):
             await send_admin_welcome(client, message.chat.id)
+            mark_welcomed(user_id)
+        else:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ Admin Panel", callback_data="adm_back")]])
+            await client.send_message(message.chat.id, "Welcome back, Administrator.", reply_markup=kb)
         return
 
     conf = get_settings()
@@ -208,11 +352,17 @@ async def verify_cb(client, cq: CallbackQuery):
 
 
 async def deliver_start(client, chat_id, user_id, code):
-    # If this /start carries a file code, the user came from a shared link -
-    # deliver the file directly instead of showing the welcome card again.
-    # The welcome card is only meant for a first-time / plain /start.
+    # If this /start carries a code, the user came from a shared link -
+    # deliver the content directly, no need for the welcome card at all.
     if code:
-        await send_file_by_code(client, chat_id, code)
+        await deliver_code(client, chat_id, code)
+        return
+
+    # Plain /start with no code: only show the full welcome card the first
+    # time this user is ever seen. Returning users (already FSUB-verified
+    # before) get a short acknowledgement instead of the whole card again.
+    if has_welcomed(user_id):
+        await client.send_message(chat_id, "Welcome back.")
         return
 
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("❓ Help", callback_data="show_help")]])
@@ -222,6 +372,7 @@ async def deliver_start(client, chat_id, user_id, code):
         f"{CREDIT_LINE}"
     )
     await client.send_message(chat_id, text, reply_markup=kb, disable_web_page_preview=True)
+    mark_welcomed(user_id)
 
 
 async def send_admin_welcome(client, chat_id):
@@ -262,6 +413,60 @@ async def help_cb(client, cq: CallbackQuery):
     await cq.message.reply(HELP_TEXT, disable_web_page_preview=True)
 
 
+async def deliver_code(client, chat_id, code):
+    """Resolves any /start code - special-link, batch, or a normal single
+    file - and delivers the underlying content."""
+    if code.startswith(SPECIAL_PREFIX):
+        token = code[len(SPECIAL_PREFIX):]
+        status, inner_code = claim_special_link(token)
+        if status != "ok":
+            reply_text = {
+                "revoked": "🚫 This link has been revoked.",
+                "expired": "⏳ This link's time limit has expired.",
+                "limit_reached": "🚫 This link's view limit has been reached.",
+            }.get(status, "⚠️ This link is invalid or has expired.")
+            await client.send_message(chat_id, reply_text)
+            return
+        code = inner_code
+
+    if code.startswith(BATCH_PREFIX):
+        await deliver_batch(client, chat_id, code)
+        return
+
+    await send_file_by_code(client, chat_id, code)
+
+
+async def deliver_batch(client, chat_id, code):
+    doc = batch_col.find_one({"_id": code})
+    if not doc:
+        await client.send_message(chat_id, "⚠️ This batch link is invalid or has expired.")
+        return
+
+    start_id, end_id = doc["start_msg_id"], doc["end_msg_id"]
+    conf = get_settings()
+    protect = not (conf.get("share_enabled", True) and conf.get("save_enabled", True))
+    delay = conf.get("auto_delete", 0)
+
+    status_msg = await client.send_message(chat_id, f"Sending {end_id - start_id + 1} file(s), please wait...")
+    sent_count = 0
+    for msg_id in range(start_id, end_id + 1):
+        try:
+            sent = await client.copy_message(
+                chat_id=chat_id, from_chat_id=DB_CHANNEL_ID, message_id=msg_id, protect_content=protect
+            )
+            sent_count += 1
+            if delay and delay > 0:
+                schedule_deletion(chat_id, sent.id, delay)
+            await asyncio.sleep(0.3)
+        except Exception:
+            continue
+
+    summary = f"✅ Delivered {sent_count} file(s)."
+    if delay and delay > 0:
+        summary += f" These will be automatically deleted in {delay} seconds."
+    await status_msg.edit_text(summary)
+
+
 async def send_file_by_code(client, chat_id, code):
     doc = files_col.find_one({"_id": code})
     if not doc:
@@ -289,16 +494,10 @@ async def send_file_by_code(client, chat_id, code):
         warn = await client.send_message(
             chat_id, f"⚠️ This file will be automatically deleted in **{delay} seconds**. Please save or forward it now."
         )
-        asyncio.create_task(auto_delete(client, chat_id, [sent.id, warn.id], delay))
-
-
-async def auto_delete(client, chat_id, msg_ids, delay):
-    await asyncio.sleep(delay)
-    for mid in msg_ids:
-        try:
-            await client.delete_messages(chat_id, mid)
-        except Exception:
-            pass
+        # Persisted to MongoDB (not asyncio.sleep) so scheduled deletions
+        # survive a bot restart - deletion_sweeper() picks these up.
+        schedule_deletion(chat_id, sent.id, delay)
+        schedule_deletion(chat_id, warn.id, delay)
 
 
 # ============================================================
@@ -346,7 +545,7 @@ async def save_file_handler(client, message: Message):
     except Exception as e:
         log.error(f"Failed to post link under file in DB channel: {e}")
 
-    await message.reply(f"✅ **File Saved Successfully**\n\nShare Link (tap to copy):\n`{link}`")
+    await message.reply(f"✅ **File Saved Successfully**\n\nShare Link (tap to copy):\n`{link}`\n\nDB Message ID: `{copied.id}` (needed for `/batch`)")
 
 
 # ============================================================
@@ -490,7 +689,7 @@ async def admin_cb(client, cq: CallbackQuery):
     filters.text
     & filters.private
     & filters.user(ADMIN_IDS)
-    & ~filters.command(["start", "admin", "broadcast", "getid"])
+    & ~filters.command(["start", "admin", "broadcast", "getid", "ban", "unban", "batch", "speciallink", "speciallinkstats", "help"])
 )
 async def handle_admin_text(client, message: Message):
     admin_id = message.from_user.id
@@ -570,8 +769,250 @@ async def getid_handler(client, message: Message):
 
 
 # ============================================================
+# BAN SYSTEM
+# ============================================================
+@app.on_message(filters.command("ban") & filters.private & filters.user(ADMIN_IDS))
+async def cmd_ban(client, message: Message):
+    parts = message.text.split(None, 3)
+    if len(parts) < 2:
+        await message.reply(
+            "Usage: `/ban <user_id> [duration] [reason]`\n"
+            "Duration is optional: `30m`, `2h`, `1d`. Omit it for a permanent ban."
+        )
+        return
+    try:
+        target = int(parts[1])
+    except ValueError:
+        await message.reply("The user ID must be numeric.")
+        return
+    if is_admin(target):
+        await message.reply("🚫 Admins cannot be banned.")
+        return
+
+    expires_at = None
+    reason = None
+    if len(parts) >= 3:
+        seconds = parse_duration(parts[2])
+        if seconds is not None:
+            expires_at = datetime.utcnow() + timedelta(seconds=seconds)
+            if len(parts) == 4:
+                reason = parts[3]
+        else:
+            reason = message.text.split(None, 2)[2]
+
+    ban_user(target, reason, expires_at)
+    reply = f"✅ User `{target}` has been banned."
+    reply += f"\n⏳ Auto-unban at: `{expires_at.isoformat()} UTC`" if expires_at else "\n⏳ Type: Permanent"
+    if reason:
+        reply += f"\nReason: {reason}"
+    await message.reply(reply)
+
+
+@app.on_message(filters.command("unban") & filters.private & filters.user(ADMIN_IDS))
+async def cmd_unban(client, message: Message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.reply("Usage: `/unban <user_id>`")
+        return
+    try:
+        target = int(parts[1])
+    except ValueError:
+        await message.reply("The user ID must be numeric.")
+        return
+    unban_user(target)
+    await message.reply(f"✅ User `{target}` has been unbanned.")
+
+
+# ============================================================
+# BATCH LINKS
+# ============================================================
+@app.on_message(filters.command("batch") & filters.private & filters.user(ADMIN_IDS))
+async def create_batch_link(client, message: Message):
+    parts = message.text.split()
+    if len(parts) != 3:
+        await message.reply(
+            "Usage: `/batch <start_msg_id> <end_msg_id>`\n\n"
+            "Use the DB channel message IDs (shown when a file is uploaded, "
+            "or via Telegram's \"Copy Message Link\" on any message in the DB channel)."
+        )
+        return
+    try:
+        start_id, end_id = int(parts[1]), int(parts[2])
+    except ValueError:
+        await message.reply("start_msg_id and end_msg_id must be numeric.")
+        return
+    if start_id > end_id:
+        await message.reply("start_msg_id must be less than or equal to end_msg_id.")
+        return
+    if (end_id - start_id + 1) > MAX_BATCH_SIZE:
+        await message.reply(
+            f"A batch link can contain at most {MAX_BATCH_SIZE} files "
+            f"(requested {end_id - start_id + 1}). Use a smaller range, or raise the `MAX_BATCH_SIZE` env var."
+        )
+        return
+
+    token = gen_batch_code()
+    batch_col.insert_one(
+        {
+            "_id": token,
+            "start_msg_id": start_id,
+            "end_msg_id": end_id,
+            "created_by": message.from_user.id,
+            "created_at": datetime.utcnow(),
+        }
+    )
+    username = await get_bot_username(client)
+    link = f"https://t.me/{username}?start={token}"
+    await message.reply(f"✅ **Batch Link Ready**\n\nFiles: {end_id - start_id + 1}\nLink (tap to copy):\n`{link}`")
+
+
+# ============================================================
+# SPECIAL (VIEW/TIME-LIMITED) LINKS
+# ============================================================
+SPECIAL_LINK_USAGE = (
+    "**Usage:**\n"
+    "`/speciallink <link_or_code> views <N>` — usable a total of N times (across all users)\n"
+    "`/speciallink <link_or_code> time <duration>` — expires after the given duration (e.g. `30m`, `2h`, `1d`)\n"
+    "Both can be combined — whichever limit is hit first wins:\n"
+    "`/speciallink <link_or_code> views 5 time 1h`"
+)
+
+
+@app.on_message(filters.command("speciallink") & filters.private & filters.user(ADMIN_IDS))
+async def speciallink_cmd(client, message: Message):
+    args = message.text.split()[1:]
+    if len(args) < 3:
+        await message.reply(SPECIAL_LINK_USAGE)
+        return
+
+    source_code = extract_code(args[0])
+    if source_code.startswith(SPECIAL_PREFIX):
+        await message.reply("A special link cannot be created from another special link. Use the original file's normal link instead.")
+        return
+
+    exists = files_col.find_one({"_id": source_code}) or batch_col.find_one({"_id": source_code})
+    if not exists:
+        await message.reply("This code/link does not correspond to any uploaded file or batch.")
+        return
+
+    max_views = None
+    expires_at = None
+    i = 1  # args[0] is the source link, skip it
+    while i < len(args) - 1:
+        key = args[i].lower()
+        if key in ("views", "view", "v"):
+            try:
+                max_views = int(args[i + 1])
+            except ValueError:
+                await message.reply("`views` must be followed by a number, e.g. `views 5`.")
+                return
+            if max_views < 1:
+                await message.reply("`views` must be at least 1.")
+                return
+            i += 2
+        elif key in ("time", "t"):
+            secs = parse_duration(args[i + 1])
+            if secs is None:
+                await message.reply("Could not parse the time value. Try `time 30m`, `time 2h`, or `time 1d`.")
+                return
+            expires_at = datetime.utcnow() + timedelta(seconds=secs)
+            i += 2
+        else:
+            i += 1
+
+    if max_views is None and expires_at is None:
+        await message.reply("Please provide at least one limit — `views <N>` or `time <duration>`.\n\n" + SPECIAL_LINK_USAGE)
+        return
+
+    token = create_special_link(source_code, max_views, expires_at)
+    username = await get_bot_username(client)
+    link = f"https://t.me/{username}?start={SPECIAL_PREFIX}{token}"
+
+    detail_lines = []
+    if max_views is not None:
+        detail_lines.append(f"Max views: `{max_views}` (total, across all users)")
+    if expires_at:
+        detail_lines.append(f"Expires at: `{expires_at.isoformat()} UTC`")
+
+    await message.reply(
+        "🔒 **Special Link Ready**\n\n`" + link + "`\n" + "\n".join(detail_lines)
+        + "\n\nOnce the limit is reached, this link will stop delivering content."
+    )
+
+
+@app.on_message(filters.command("speciallinkstats") & filters.private & filters.user(ADMIN_IDS))
+async def speciallinkstats_cmd(client, message: Message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.reply("Usage: `/speciallinkstats <link_or_token>`")
+        return
+    token = extract_code(parts[1])
+    if token.startswith(SPECIAL_PREFIX):
+        token = token[len(SPECIAL_PREFIX):]
+
+    doc = special_links_col.find_one({"_id": token})
+    if not doc:
+        await message.reply("This special-link token does not exist.")
+        return
+
+    status = "🚫 Revoked" if doc.get("revoked") else "✅ Active"
+    lines = [f"📊 **Special Link Stats — `{token}`**", f"Status: {status}", f"Created: `{doc['created_at'].isoformat()} UTC`"]
+    max_views = doc.get("max_views")
+    if max_views is not None:
+        lines.append(f"Views used: `{doc.get('views_used', 0)}/{max_views}`")
+    else:
+        lines.append(f"Views used: `{doc.get('views_used', 0)}` (no view limit)")
+    if doc.get("expires_at"):
+        lines.append(f"Expires at: `{doc['expires_at'].isoformat()} UTC`")
+    await message.reply("\n".join(lines))
+
+
+# ============================================================
+# BACKGROUND SWEEPERS (restart-safe: state lives in MongoDB, not memory)
+# ============================================================
+async def ban_sweeper():
+    while True:
+        try:
+            for user_id in get_expired_bans():
+                unban_user(user_id)
+                for admin_id in ADMIN_IDS:
+                    try:
+                        await app.send_message(admin_id, f"Temporary ban expired — user `{user_id}` has been automatically unbanned.")
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.error(f"Ban sweeper error: {e}")
+        await asyncio.sleep(60)
+
+
+async def deletion_sweeper():
+    while True:
+        try:
+            now = datetime.utcnow()
+            for d in list(pending_deletions_col.find({"delete_at": {"$lte": now}})):
+                try:
+                    await app.delete_messages(d["chat_id"], d["message_id"])
+                except Exception:
+                    pass
+                pending_deletions_col.delete_one({"_id": d["_id"]})
+        except Exception as e:
+            log.error(f"Deletion sweeper error: {e}")
+        await asyncio.sleep(15)
+
+
+# ============================================================
 # RUN
 # ============================================================
+async def main():
+    await app.start()
+    username = await get_bot_username(app)
+    asyncio.create_task(ban_sweeper())
+    asyncio.create_task(deletion_sweeper())
+    log.info(f"RoxieCloud Bot is live as @{username}")
+    await idle()
+    await app.stop()
+
+
 if __name__ == "__main__":
     log.info("Starting RoxieCloud Bot...")
-    app.run()
+    app.run(main())
