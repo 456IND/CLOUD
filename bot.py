@@ -135,11 +135,14 @@ async def start_handler(client, message: Message):
     args = message.command
     code = args[1] if len(args) > 1 else None
 
-    # Admin auto-recognized: skip FSUB entirely, show admin welcome card
+    # Admin auto-recognized: skip FSUB entirely
     if is_admin(user_id):
-        await send_admin_welcome(client, message.chat.id)
         if code:
+            # Deliver the file directly - repeating the welcome card on every
+            # single file link would be redundant.
             await send_file_by_code(client, message.chat.id, code)
+        else:
+            await send_admin_welcome(client, message.chat.id)
         return
 
     conf = get_settings()
@@ -156,7 +159,7 @@ async def start_handler(client, message: Message):
 
     if not joined:
         pending_start_payload[user_id] = code
-        m1 = await message.reply("🧑‍💻")
+        m1 = await message.reply("🔒 **Access Restricted**")
         kb = InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("📢 Join Channel", url=conf.get("fsub_invite_link") or "https://t.me")],
@@ -164,7 +167,7 @@ async def start_handler(client, message: Message):
             ]
         )
         m2 = await message.reply(
-            "Bhai pehle humare channel ko join karo, uske baad **Verify** dabao.",
+            "Please join our channel first, then tap **Verify** below to continue.",
             reply_markup=kb,
         )
         join_msgs[user_id] = [m1.id, m2.id]
@@ -181,12 +184,12 @@ async def verify_cb(client, cq: CallbackQuery):
     try:
         await client.get_chat_member(conf["fsub_channel_id"], user_id)
     except UserNotParticipant:
-        await cq.answer("Abhi tak channel join nahi kiya bhai. Pehle join karo.", show_alert=True)
+        await cq.answer("You have not joined the channel yet. Please join first.", show_alert=True)
         return
     except RPCError:
         pass
 
-    await cq.answer("Verified ✅")
+    await cq.answer("Verification successful ✅")
 
     for mid in join_msgs.get(user_id, []):
         try:
@@ -205,15 +208,20 @@ async def verify_cb(client, cq: CallbackQuery):
 
 
 async def deliver_start(client, chat_id, user_id, code):
+    # If this /start carries a file code, the user came from a shared link -
+    # deliver the file directly instead of showing the welcome card again.
+    # The welcome card is only meant for a first-time / plain /start.
+    if code:
+        await send_file_by_code(client, chat_id, code)
+        return
+
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("❓ Help", callback_data="show_help")]])
     text = (
         "🪪 **Welcome to RoxieCloud!**\n\n"
-        "Main files store aur securely share karne ke liye bana hoon.\n\n"
+        "This bot securely stores your files and lets you share them via links.\n\n"
         f"{CREDIT_LINE}"
     )
     await client.send_message(chat_id, text, reply_markup=kb, disable_web_page_preview=True)
-    if code:
-        await send_file_by_code(client, chat_id, code)
 
 
 async def send_admin_welcome(client, chat_id):
@@ -224,8 +232,8 @@ async def send_admin_welcome(client, chat_id):
         ]
     )
     text = (
-        "🪪 **Welcome back, Boss!**\n\n"
-        "Bot fully operational hai. Neeche se seedha Admin Panel khol sakte ho.\n\n"
+        "🪪 **Welcome back, Administrator!**\n\n"
+        "The bot is fully operational. You can open the Admin Panel directly below.\n\n"
         f"{CREDIT_LINE}"
     )
     await client.send_message(chat_id, text, reply_markup=kb, disable_web_page_preview=True)
@@ -233,12 +241,12 @@ async def send_admin_welcome(client, chat_id):
 
 HELP_TEXT = (
     "**📖 RoxieCloud — Help**\n\n"
-    "Ye ek file-store bot hai. Admin files upload karta hai, bot ek shareable "
-    "link generate karta hai, aur wahi link se koi bhi wo file access kar sakta hai.\n\n"
+    "This is a file-storage bot. The administrator uploads files, the bot generates "
+    "a shareable link for each one, and anyone with that link can access the file.\n\n"
     "**Commands:**\n"
-    "• `/start` — Bot shuru karo\n"
-    "• Kisi shared link pe click karoge toh `/start <code>` khud trigger hoga aur file mil jayegi\n"
-    "• `/help` — Ye message\n\n"
+    "• `/start` — Start the bot\n"
+    "• Clicking a shared link automatically triggers `/start <code>` and delivers the file\n"
+    "• `/help` — Show this message\n\n"
     f"{CREDIT_LINE}"
 )
 
@@ -257,7 +265,7 @@ async def help_cb(client, cq: CallbackQuery):
 async def send_file_by_code(client, chat_id, code):
     doc = files_col.find_one({"_id": code})
     if not doc:
-        await client.send_message(chat_id, "⚠️ Ye link invalid ya expire ho chuka hai.")
+        await client.send_message(chat_id, "⚠️ This link is invalid or has expired.")
         return
 
     conf = get_settings()
@@ -273,13 +281,13 @@ async def send_file_by_code(client, chat_id, code):
         )
     except Exception as e:
         log.error(f"Failed to deliver file {code}: {e}")
-        await client.send_message(chat_id, "❌ File deliver karne mein error aa gaya.")
+        await client.send_message(chat_id, "❌ An error occurred while delivering the file.")
         return
 
     delay = conf.get("auto_delete", 0)
     if delay and delay > 0:
         warn = await client.send_message(
-            chat_id, f"⚠️ Ye file **{delay} second** mein auto-delete ho jayegi. Turant save/forward kar lo."
+            chat_id, f"⚠️ This file will be automatically deleted in **{delay} seconds**. Please save or forward it now."
         )
         asyncio.create_task(auto_delete(client, chat_id, [sent.id, warn.id], delay))
 
@@ -309,7 +317,7 @@ async def save_file_handler(client, message: Message):
     except Exception as e:
         log.error(f"DB channel copy failed: {e}")
         await message.reply(
-            "❌ DB channel mein file save nahi ho payi.\nCheck: bot DB channel mein admin hai ya nahi?"
+            "❌ Failed to save the file to the DB channel.\nPlease check whether the bot has admin rights there."
         )
         return
 
@@ -325,7 +333,20 @@ async def save_file_handler(client, message: Message):
 
     username = await get_bot_username(client)
     link = f"https://t.me/{username}?start={code}"
-    await message.reply(f"✅ **File saved!**\n\nShare link (tap to copy):\n`{link}`")
+
+    # Post the link directly under the file in the DB channel too (as a reply,
+    # so it stays visually attached), in monospace so it can be tapped to copy
+    # and re-shared without needing to come back to the bot's DM.
+    try:
+        await client.send_message(
+            DB_CHANNEL_ID,
+            f"`{link}`",
+            reply_to_message_id=copied.id,
+        )
+    except Exception as e:
+        log.error(f"Failed to post link under file in DB channel: {e}")
+
+    await message.reply(f"✅ **File Saved Successfully**\n\nShare Link (tap to copy):\n`{link}`")
 
 
 # ============================================================
@@ -374,7 +395,7 @@ def time_kb():
 
 @app.on_message(filters.command("admin") & filters.private & filters.user(ADMIN_IDS))
 async def admin_panel(client, message: Message):
-    await message.reply("🛠 **Admin Panel**\n\nChoose an option below:", reply_markup=admin_main_kb())
+    await message.reply("🛠 **Admin Panel**\n\nPlease select an option below:", reply_markup=admin_main_kb())
 
 
 @app.on_callback_query(filters.regex("^adm_") & filters.user(ADMIN_IDS))
@@ -382,15 +403,15 @@ async def admin_cb(client, cq: CallbackQuery):
     data = cq.data
 
     if data == "adm_back":
-        await cq.message.edit_text("🛠 **Admin Panel**\n\nChoose an option below:", reply_markup=admin_main_kb())
+        await cq.message.edit_text("🛠 **Admin Panel**\n\nPlease select an option below:", reply_markup=admin_main_kb())
 
     elif data == "adm_exit":
         await cq.message.delete()
 
     elif data == "adm_broadcast_info":
         await cq.message.edit_text(
-            "**Broadcast**\n\nEk message type karo (text/link/emoji sab chalega), "
-            "phir usi message pe reply karke `/broadcast` bhejo.",
+            "**Broadcast**\n\nType a message (text, link, or emoji are all supported), "
+            "then reply to that message with `/broadcast` to send it to all users.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]),
         )
 
@@ -411,8 +432,8 @@ async def admin_cb(client, cq: CallbackQuery):
 
     elif data == "adm_getid_info":
         await cq.message.edit_text(
-            "**GetId**\n\nKisi bhi message (channel/group/user) ko yaha forward ya send karo, "
-            "phir usi message pe reply karke `/getid` bhejo.",
+            "**Get ID**\n\nForward or send any message (from a channel, group, or user) here, "
+            "then reply to that message with `/getid`.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]),
         )
 
@@ -435,14 +456,14 @@ async def admin_cb(client, cq: CallbackQuery):
         await cq.message.edit_text("**Settings**", reply_markup=settings_kb(get_settings()))
 
     elif data == "adm_time":
-        await cq.message.edit_text("**Auto-Delete Timer**\n\nDelivered files kitni der baad delete ho:", reply_markup=time_kb())
+        await cq.message.edit_text("**Auto-Delete Timer**\n\nSelect how long delivered files should remain before being automatically deleted:", reply_markup=time_kb())
 
     elif data.startswith("adm_time_"):
         seconds = int(data.split("_")[-1])
         update_setting("auto_delete", seconds)
-        await cq.answer(f"Timer set: {seconds}s" if seconds else "Timer OFF")
+        await cq.answer(f"Timer set to {seconds} seconds" if seconds else "Timer turned off")
         label = f"{seconds}s" if seconds else "OFF"
-        await cq.message.edit_text(f"**Auto-Delete Timer**\n\nCurrent: {label}\n\nDelivered files kitni der baad delete ho:", reply_markup=time_kb())
+        await cq.message.edit_text(f"**Auto-Delete Timer**\n\nCurrent: {label}\n\nSelect how long delivered files should remain before being automatically deleted:", reply_markup=time_kb())
 
     elif data == "adm_edit":
         kb = InlineKeyboardMarkup(
@@ -456,11 +477,11 @@ async def admin_cb(client, cq: CallbackQuery):
 
     elif data == "adm_edit_id":
         pending_edit[cq.from_user.id] = "fsub_id"
-        await cq.message.edit_text("Naya FSUB Channel ID bhejo (jaise `-1001234567890`):")
+        await cq.message.edit_text("Please send the new FSUB Channel ID (e.g. `-1001234567890`):")
 
     elif data == "adm_edit_link":
         pending_edit[cq.from_user.id] = "fsub_link"
-        await cq.message.edit_text("Naya FSUB invite link bhejo (jaise `https://t.me/+xxxxxxxxxxxx`):")
+        await cq.message.edit_text("Please send the new FSUB invite link (e.g. `https://t.me/+xxxxxxxxxxxx`):")
 
     await cq.answer()
 
@@ -483,7 +504,7 @@ async def handle_admin_text(client, message: Message):
             update_setting("fsub_channel_id", new_id)
             await message.reply(f"✅ FSUB Channel ID updated: `{new_id}`")
         except ValueError:
-            await message.reply("❌ Invalid ID. Number jaisa hona chahiye, e.g. `-1001234567890`")
+            await message.reply("❌ Invalid ID. It must be a numeric value, e.g. `-1001234567890`")
     elif action == "fsub_link":
         update_setting("fsub_invite_link", message.text.strip())
         await message.reply("✅ FSUB invite link updated.")
@@ -521,7 +542,7 @@ async def broadcast_handler(client, message: Message):
 
 @app.on_message(filters.command("broadcast") & filters.private & filters.user(ADMIN_IDS) & ~filters.reply)
 async def broadcast_no_reply(client, message: Message):
-    await message.reply("Kisi message pe reply karke `/broadcast` bhejo.")
+    await message.reply("Please reply to a message with `/broadcast` to send it.")
 
 
 # ============================================================
