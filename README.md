@@ -62,10 +62,13 @@ Channel ki numeric ID nikalne ke liye:
 
 | Command | Kaun use kare | Kya karta hai |
 |---|---|---|
-| `/start` | Sabhi users | Bot start, FSUB check, file deliver (agar link se aaya ho) |
+| `/start` | Sabhi users | Bot start. Agar tum `ADMIN_IDS` mein ho, FSUB skip hoke seedha Admin welcome card + Admin Panel button milega. Normal users ke liye FSUB check, phir welcome + file deliver (agar link se aaya ho) |
+| `/help` | Sabhi users | Bot ka use kaise kare, ye batata hai |
 | `/admin` | Sirf Admins | Admin panel kholta hai |
 | `/broadcast` | Sirf Admins | Kisi message pe **reply** karke, sabko wo msg bhejta hai |
 | `/getid` | Sirf Admins | Reply kiye gaye message/channel/user ki ID batata hai |
+
+> **Note:** Admin ko FSUB join karne ki zaroorat nahi — `ADMIN_IDS` mein listed IDs automatically recognize hoti hain aur seedha Admin Panel button wala welcome card milta hai. Normal users ko ye button kabhi nahi dikhega.
 
 ### Admin Panel features
 - **Broadcast** — reply-based broadcast, saare users ko msg jayega

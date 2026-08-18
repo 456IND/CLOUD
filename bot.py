@@ -46,6 +46,11 @@ if not ADMIN_IDS:
     log.warning("ADMIN_IDS is empty! No one will be able to access the admin panel.")
 
 # ============================================================
+# BRANDING / CREDITS
+# ============================================================
+CREDIT_LINE = "👨‍💻 Developed by [RoxieADMIN](https://t.me/RoxieADMIN) • [GitHub](https://github.com/456IND)"
+
+# ============================================================
 # DATABASE
 # ============================================================
 mongo = MongoClient(MONGO_URI)
@@ -130,6 +135,13 @@ async def start_handler(client, message: Message):
     args = message.command
     code = args[1] if len(args) > 1 else None
 
+    # Admin auto-recognized: skip FSUB entirely, show admin welcome card
+    if is_admin(user_id):
+        await send_admin_welcome(client, message.chat.id)
+        if code:
+            await send_file_by_code(client, message.chat.id, code)
+        return
+
     conf = get_settings()
 
     joined = True
@@ -193,13 +205,53 @@ async def verify_cb(client, cq: CallbackQuery):
 
 
 async def deliver_start(client, chat_id, user_id, code):
-    await client.send_message(chat_id, "🪪")
-    await client.send_message(
-        chat_id,
-        "**Welcome to RoxieCloud!**\n\nMain files store aur share karne ke liye bana hoon.",
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❓ Help", callback_data="show_help")]])
+    text = (
+        "🪪 **Welcome to RoxieCloud!**\n\n"
+        "Main files store aur securely share karne ke liye bana hoon.\n\n"
+        f"{CREDIT_LINE}"
     )
+    await client.send_message(chat_id, text, reply_markup=kb, disable_web_page_preview=True)
     if code:
         await send_file_by_code(client, chat_id, code)
+
+
+async def send_admin_welcome(client, chat_id):
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("⚙️ Admin Panel", callback_data="adm_back")],
+            [InlineKeyboardButton("❓ Help", callback_data="show_help")],
+        ]
+    )
+    text = (
+        "🪪 **Welcome back, Boss!**\n\n"
+        "Bot fully operational hai. Neeche se seedha Admin Panel khol sakte ho.\n\n"
+        f"{CREDIT_LINE}"
+    )
+    await client.send_message(chat_id, text, reply_markup=kb, disable_web_page_preview=True)
+
+
+HELP_TEXT = (
+    "**📖 RoxieCloud — Help**\n\n"
+    "Ye ek file-store bot hai. Admin files upload karta hai, bot ek shareable "
+    "link generate karta hai, aur wahi link se koi bhi wo file access kar sakta hai.\n\n"
+    "**Commands:**\n"
+    "• `/start` — Bot shuru karo\n"
+    "• Kisi shared link pe click karoge toh `/start <code>` khud trigger hoga aur file mil jayegi\n"
+    "• `/help` — Ye message\n\n"
+    f"{CREDIT_LINE}"
+)
+
+
+@app.on_message(filters.command("help") & filters.private)
+async def help_cmd(client, message: Message):
+    await message.reply(HELP_TEXT, disable_web_page_preview=True)
+
+
+@app.on_callback_query(filters.regex("^show_help$"))
+async def help_cb(client, cq: CallbackQuery):
+    await cq.answer()
+    await cq.message.reply(HELP_TEXT, disable_web_page_preview=True)
 
 
 async def send_file_by_code(client, chat_id, code):
@@ -282,23 +334,27 @@ async def save_file_handler(client, message: Message):
 def admin_main_kb():
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("📢 Broadcast", callback_data="adm_broadcast_info")],
-            [InlineKeyboardButton("🐞 Debug", callback_data="adm_debug")],
-            [InlineKeyboardButton("⚙️ Settings", callback_data="adm_settings")],
-            [InlineKeyboardButton("✏️ Edit", callback_data="adm_edit")],
-            [InlineKeyboardButton("🆔 GetId", callback_data="adm_getid_info")],
+            [InlineKeyboardButton("📢 Broadcast", callback_data="adm_broadcast_info"),
+             InlineKeyboardButton("🐞 Debug", callback_data="adm_debug")],
+            [InlineKeyboardButton("⚙️ Settings", callback_data="adm_settings"),
+             InlineKeyboardButton("✏️ Edit", callback_data="adm_edit")],
+            [InlineKeyboardButton("🆔 GetId", callback_data="adm_getid_info"),
+             InlineKeyboardButton("❓ Help", callback_data="show_help")],
             [InlineKeyboardButton("❌ Exit", callback_data="adm_exit")],
         ]
     )
 
 
 def settings_kb(conf):
+    share_label = f"🔗 Share: {'✅ ON' if conf.get('share_enabled') else '🚫 OFF'}"
+    save_label = f"💾 Save: {'✅ ON' if conf.get('save_enabled') else '🚫 OFF'}"
+    fsub_label = f"📢 FSUB: {'✅ ON' if conf.get('fsub_enabled') else '🚫 OFF'}"
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("⏱ Time Changer", callback_data="adm_time")],
-            [InlineKeyboardButton(f"🔗 Share: {'ON' if conf.get('share_enabled') else 'OFF'}", callback_data="adm_toggle_share")],
-            [InlineKeyboardButton(f"💾 Save: {'ON' if conf.get('save_enabled') else 'OFF'}", callback_data="adm_toggle_save")],
-            [InlineKeyboardButton(f"📢 FSUB: {'ON' if conf.get('fsub_enabled') else 'OFF'}", callback_data="adm_toggle_fsub")],
+            [InlineKeyboardButton(share_label, callback_data="adm_toggle_share"),
+             InlineKeyboardButton(save_label, callback_data="adm_toggle_save")],
+            [InlineKeyboardButton(fsub_label, callback_data="adm_toggle_fsub")],
             [InlineKeyboardButton("🔙 Back", callback_data="adm_back")],
         ]
     )
@@ -318,7 +374,7 @@ def time_kb():
 
 @app.on_message(filters.command("admin") & filters.private & filters.user(ADMIN_IDS))
 async def admin_panel(client, message: Message):
-    await message.reply("**Admin Panel**\n\nChoose an option:", reply_markup=admin_main_kb())
+    await message.reply("🛠 **Admin Panel**\n\nChoose an option below:", reply_markup=admin_main_kb())
 
 
 @app.on_callback_query(filters.regex("^adm_") & filters.user(ADMIN_IDS))
@@ -326,7 +382,7 @@ async def admin_cb(client, cq: CallbackQuery):
     data = cq.data
 
     if data == "adm_back":
-        await cq.message.edit_text("**Admin Panel**\n\nChoose an option:", reply_markup=admin_main_kb())
+        await cq.message.edit_text("🛠 **Admin Panel**\n\nChoose an option below:", reply_markup=admin_main_kb())
 
     elif data == "adm_exit":
         await cq.message.delete()
