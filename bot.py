@@ -17,7 +17,7 @@ API_ID = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
 MONGODB_URL = os.environ.get("MONGODB_URL")
 ADMIN_ID = os.environ.get("ADMIN_ID")
-DB_CHANNEL_ID = os.environ.get("DB_CHANNEL_ID")  # fallback agar /setdb nahi chala
+DB_CHANNEL_ID = os.environ.get("DB_CHANNEL_ID")
 
 missing = [name for name, val in {
     "BOT_TOKEN": BOT_TOKEN, "API_ID": API_ID, "API_HASH": API_HASH,
@@ -37,9 +37,7 @@ settings_col = db["settings"]
 tokens_col = db["tokens"]
 
 PAGE_SIZE = 10
-
-# Waiting state - kisko "next value" ka wait hai (e.g. admin ne "Set Timer" dabaya, ab reply ka wait)
-pending_action = {}
+pending_action = {}  # { user_id: "awaiting_xxx" }
 
 
 # ==========================================
@@ -70,7 +68,6 @@ async def get_db_channel_id():
 
 
 async def is_fsub_joined(client, user_id):
-    """FSUB channel join check karta hai. Agar FSUB set hi nahi hai to True (no restriction)."""
     config = await get_config()
     fsub_id = config.get("fsub_id")
     if not fsub_id:
@@ -81,27 +78,31 @@ async def is_fsub_joined(client, user_id):
     except UserNotParticipant:
         return False
     except Exception:
-        # Agar bot admin nahi hai channel me ya koi aur error, restriction skip karo (fail-open)
-        return True
+        return True  # fail-open agar bot admin nahi hai ya koi aur error
 
 
 # ==========================================
-# 🛠 ADMIN PANEL (Inline Buttons)
+# 🛠 ADMIN PANEL
 # ==========================================
 
-def admin_panel_markup():
+async def admin_panel_markup():
+    config = await get_config()
+    protect_status = "🟢 ON" if config.get("content_protection") else "🔴 OFF"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 Set FSUB", callback_data="panel_setfsub"),
          InlineKeyboardButton("🗄 Set DB Channel", callback_data="panel_setdb")],
         [InlineKeyboardButton("⏱ Set Timer", callback_data="panel_settimer"),
-         InlineKeyboardButton("🔑 Generate Token", callback_data="panel_gentoken")],
-        [InlineKeyboardButton("❌ Revoke Token", callback_data="panel_revoke")],
+         InlineKeyboardButton("🗑 Auto-Delete", callback_data="panel_autodelete")],
+        [InlineKeyboardButton("🔑 Generate Token", callback_data="panel_gentoken"),
+         InlineKeyboardButton("❌ Revoke Token", callback_data="panel_revoke")],
+        [InlineKeyboardButton(f"🔒 Content Protection: {protect_status}", callback_data="panel_toggleprotect")],
+        [InlineKeyboardButton("🚪 Quit", callback_data="panel_quit")],
     ])
 
 
 @app.on_message(filters.command("admin") & filters.user(ADMIN_ID))
 async def admin_panel(client, message):
-    await message.reply_text("🛠 **Admin Panel** — neeche se option chuno:", reply_markup=admin_panel_markup())
+    await message.reply_text("🛠 **Admin Panel** — neeche se option chuno:", reply_markup=await admin_panel_markup())
 
 
 @app.on_callback_query(filters.regex(r"^panel_") & filters.user(ADMIN_ID))
@@ -109,16 +110,38 @@ async def panel_callback(client, callback_query):
     action = callback_query.data.split("_", 1)[1]
     user_id = callback_query.from_user.id
 
+    if action == "quit":
+        pending_action.pop(user_id, None)
+        return await callback_query.message.delete()
+
+    if action == "back":
+        pending_action.pop(user_id, None)
+        return await callback_query.message.edit_text(
+            "🛠 **Admin Panel** — neeche se option chuno:", reply_markup=await admin_panel_markup()
+        )
+
+    if action == "toggleprotect":
+        config = await get_config()
+        new_value = not config.get("content_protection", False)
+        await settings_col.update_one({"_id": "config"}, {"$set": {"content_protection": new_value}}, upsert=True)
+        await callback_query.answer(f"Content Protection {'ON' if new_value else 'OFF'} kar diya.")
+        return await callback_query.message.edit_text(
+            "🛠 **Admin Panel** — neeche se option chuno:", reply_markup=await admin_panel_markup()
+        )
+
+    back_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="panel_back")]])
+
     prompts = {
-        "setfsub": "📢 FSUB channel ki ID bhej (e.g. `-1001234567890`):",
+        "setfsub": "📢 Pehle FSUB **channel ID** bhej (e.g. `-1001234567890`):",
         "setdb": "🗄 DB channel ki ID bhej (e.g. `-1001234567890`):",
-        "settimer": "⏱ Default expiry time bhej (e.g. `1h`, `30m`, `1d`):",
+        "settimer": "⏱ Default token expiry time bhej (e.g. `1h`, `30m`, `1d`):",
+        "autodelete": "🗑 Files kitni der baad auto-delete ho (e.g. `10m`, `1h`). Band karne ke liye `off` bhej:",
         "gentoken": "🔑 Format me bhej:\n`<start_msg_id> <end_msg_id> <name>`\nExample: `101 112 CuteGirl`",
         "revoke": "❌ Jo token revoke karna hai uska naam bhej (e.g. `Roxie-CuteGirl`):",
     }
     pending_action[user_id] = f"awaiting_{action}"
     await callback_query.answer()
-    await callback_query.message.reply_text(prompts[action])
+    await callback_query.message.reply_text(prompts[action], reply_markup=back_btn)
 
 
 # ==========================================
@@ -126,7 +149,7 @@ async def panel_callback(client, callback_query):
 # ==========================================
 
 @app.on_message(filters.private & filters.text & filters.user(ADMIN_ID) & ~filters.command([
-    "start", "admin", "setfsub", "setdb", "settimer", "token", "revoke"
+    "start", "admin"
 ]))
 async def handle_admin_pending(client, message):
     user_id = message.from_user.id
@@ -137,8 +160,20 @@ async def handle_admin_pending(client, message):
     text = message.text.strip()
 
     if action == "awaiting_setfsub":
+        # Pehle ID le rahe hain, phir link maangenge
+        try:
+            int(text)
+        except ValueError:
+            return await message.reply_text("❌ Ye ID nahi lag rahi. Number bhej (e.g. `-1001234567890`) — dobara try kar.")
         await settings_col.update_one({"_id": "config"}, {"$set": {"fsub_id": text}}, upsert=True)
-        await message.reply_text(f"✅ FSUB channel set ho gaya: `{text}`\n\n⚠️ Bot ko us channel me admin banana mat bhoolna, warna join-check kaam nahi karega.")
+        pending_action[user_id] = "awaiting_setfsublink"
+        return await message.reply_text("✅ ID save ho gayi. Ab channel ka **invite/join link** bhej (e.g. `https://t.me/teraChannel`):")
+
+    elif action == "awaiting_setfsublink":
+        if not (text.startswith("https://t.me/") or text.startswith("t.me/")):
+            return await message.reply_text("❌ Ye valid link nahi lag raha. `https://t.me/...` format me bhej.")
+        await settings_col.update_one({"_id": "config"}, {"$set": {"fsub_link": text}}, upsert=True)
+        await message.reply_text(f"✅ FSUB poora set ho gaya!\n**ID:** saved\n**Link:** {text}\n\n⚠️ Bot ko us channel me admin banana mat bhoolna, warna join-check kaam nahi karega.")
 
     elif action == "awaiting_setdb":
         await settings_col.update_one({"_id": "config"}, {"$set": {"db_channel_id": text}}, upsert=True)
@@ -149,6 +184,17 @@ async def handle_admin_pending(client, message):
             return await message.reply_text("❌ Format galat hai. Use: 10s, 5m, 1h, 1d — dobara bhej.")
         await settings_col.update_one({"_id": "config"}, {"$set": {"default_timer": text}}, upsert=True)
         await message.reply_text(f"✅ Default timer set ho gaya: `{text}`")
+
+    elif action == "awaiting_autodelete":
+        if text.lower() == "off":
+            await settings_col.update_one({"_id": "config"}, {"$set": {"auto_delete_seconds": 0}}, upsert=True)
+            await message.reply_text("✅ Auto-delete band kar diya.")
+        else:
+            seconds = parse_time(text)
+            if seconds is None:
+                return await message.reply_text("❌ Format galat hai. Use: 10m, 1h, ya `off` — dobara bhej.")
+            await settings_col.update_one({"_id": "config"}, {"$set": {"auto_delete_seconds": seconds}}, upsert=True)
+            await message.reply_text(f"✅ Files ab {text} baad auto-delete hongi.")
 
     elif action == "awaiting_gentoken":
         parts = text.split()
@@ -190,17 +236,30 @@ async def handle_admin_pending(client, message):
         else:
             await message.reply_text(f"✅ Token `{token_id}` revoke kar diya gaya.")
 
-    pending_action.pop(user_id, None)
+    if action != "awaiting_setfsub":  # setfsub ke baad link ka wait chalu rehna chahiye
+        pending_action.pop(user_id, None)
 
 
 # ==========================================
-# 📤 FILE SENDING
+# 📤 FILE SENDING (+ AUTO-DELETE)
 # ==========================================
+
+async def schedule_delete(client, chat_id, message_id, delay_seconds):
+    await asyncio.sleep(delay_seconds)
+    try:
+        await client.delete_messages(chat_id, message_id)
+    except Exception:
+        pass  # message pehle hi delete ho chuki ho sakti hai
+
 
 async def send_batch(client, chat_id, token_data, offset):
     db_channel_id = await get_db_channel_id()
     if not db_channel_id:
         return await client.send_message(chat_id, "❌ DB Channel set nahi hai. Admin ko batao.")
+
+    config = await get_config()
+    protect = config.get("content_protection", False)
+    auto_delete_seconds = config.get("auto_delete_seconds", 0)
 
     all_files = token_data["files"]
     batch = all_files[offset: offset + PAGE_SIZE]
@@ -209,7 +268,12 @@ async def send_batch(client, chat_id, token_data, offset):
 
     for msg_id in batch:
         try:
-            await client.copy_message(chat_id=chat_id, from_chat_id=db_channel_id, message_id=msg_id)
+            sent = await client.copy_message(
+                chat_id=chat_id, from_chat_id=db_channel_id, message_id=msg_id,
+                protect_content=protect
+            )
+            if auto_delete_seconds > 0:
+                asyncio.create_task(schedule_delete(client, chat_id, sent.id, auto_delete_seconds))
             await asyncio.sleep(0.7)
         except Exception as e:
             await client.send_message(chat_id, f"⚠️ File ID {msg_id} bhejne me error: {e}")
@@ -221,6 +285,9 @@ async def send_batch(client, chat_id, token_data, offset):
             "Next ⏭", callback_data=f"next_{token_data['token_id']}_{next_offset}"
         )]])
         await client.send_message(chat_id, f"({min(next_offset, total_files)}/{total_files} files sent)", reply_markup=buttons)
+
+    if auto_delete_seconds > 0:
+        warn = await client.send_message(chat_id, f"⚠️ Ye files {auto_delete_seconds // 60 if auto_delete_seconds >= 60 else auto_delete_seconds}{'m' if auto_delete_seconds >= 60 else 's'} me delete ho jayengi, jaldi save kar lo.")
 
 
 @app.on_callback_query(filters.regex(r"^next_"))
@@ -240,12 +307,32 @@ async def next_batch_callback(client, callback_query):
 
 
 # ==========================================
-# 🚀 USER FLOW: /start -> 🧑‍💻 -> user types token -> ✅/❌ + files
+# 🚀 USER FLOW: /start -> 🧑‍💻 + Join/Verify -> 🪪 -> token -> 📤/❌
 # ==========================================
 
 @app.on_message(filters.command("start") & filters.private)
 async def start(client, message):
-    await message.reply_text("🧑‍💻")
+    config = await get_config()
+    fsub_link = config.get("fsub_link")
+
+    if fsub_link and not await is_fsub_joined(client, message.from_user.id):
+        buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 Join Channel", url=fsub_link)],
+            [InlineKeyboardButton("✅ Verify", callback_data="verify_fsub")],
+        ])
+        return await message.reply_text("🧑‍💻", reply_markup=buttons)
+
+    await message.reply_text("🪪")
+
+
+@app.on_callback_query(filters.regex(r"^verify_fsub$"))
+async def verify_fsub_callback(client, callback_query):
+    user_id = callback_query.from_user.id
+    if await is_fsub_joined(client, user_id):
+        await callback_query.answer("✅ Verified!")
+        await callback_query.message.edit_text("🪪")
+    else:
+        await callback_query.answer("❌ Abhi bhi join nahi kiya hai. Pehle join kar.", show_alert=True)
 
 
 @app.on_message(filters.private & filters.text & filters.regex(r"^Roxie-") & ~filters.user(ADMIN_ID))
@@ -254,16 +341,22 @@ async def handle_token_input(client, message):
     token = message.text.strip()
 
     if not await is_fsub_joined(client, user_id):
-        return await message.reply_text(
-            "❌ Pehle hamare channel ko join karo, uske baad token dobara bhejo.",
-        )
+        config = await get_config()
+        fsub_link = config.get("fsub_link")
+        buttons = None
+        if fsub_link:
+            buttons = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📢 Join Channel", url=fsub_link)],
+                [InlineKeyboardButton("✅ Verify", callback_data="verify_fsub")],
+            ])
+        return await message.reply_text("❌ Pehle channel join karo.", reply_markup=buttons)
 
     token_data = await tokens_col.find_one({"token_id": token})
 
     if not token_data or token_data.get("revoked") or datetime.now() > token_data["expiry_time"]:
         return await message.reply_text("❌")
 
-    await message.reply_text("✅")
+    await message.reply_text("📤")
     await send_batch(client, message.chat.id, token_data, offset=0)
 
 
