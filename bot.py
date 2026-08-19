@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import UserNotParticipant
+from pyrogram.errors import UserNotParticipant, FloodWait
 from motor.motor_asyncio import AsyncIOMotorClient
 
 # ==========================================
@@ -36,6 +36,7 @@ db_client = AsyncIOMotorClient(MONGODB_URL)
 db = db_client["RoxieDB"]
 settings_col = db["settings"]
 tokens_col = db["tokens"]
+users_col = db["users"]  # broadcast ke liye track karte hain kaun kaun /start kar chuka hai
 
 PAGE_SIZE = 10
 pending_action = {}  # { user_id: "awaiting_xxx" }
@@ -153,8 +154,11 @@ async def admin_panel_markup():
          InlineKeyboardButton("🗑 Auto-Delete", callback_data="panel_autodelete")],
         [InlineKeyboardButton("🔑 Generate Token", callback_data="panel_gentoken"),
          InlineKeyboardButton("❌ Revoke Token", callback_data="panel_revoke")],
+        [InlineKeyboardButton("🔍 Search/List Tokens", callback_data="panel_search")],
         [InlineKeyboardButton(f"🔒 Content Protection: {protect_status}", callback_data="panel_toggleprotect")],
         [InlineKeyboardButton("✏️ Edit Messages", callback_data="panel_editmsg")],
+        [InlineKeyboardButton("📣 Broadcast", callback_data="panel_broadcast"),
+         InlineKeyboardButton("🐞 Debug", callback_data="panel_debug")],
         [InlineKeyboardButton("📤 Export Settings", callback_data="panel_export"),
          InlineKeyboardButton("📥 Import Settings", callback_data="panel_import")],
         [InlineKeyboardButton("🚪 Quit", callback_data="panel_quit")],
@@ -173,6 +177,11 @@ def edit_msg_markup():
 @app.on_message(filters.command("start") & filters.private & filters.user(ADMIN_ID))
 async def admin_start(client, message):
     """Admin ke liye /start alag hai - seedha 👾 + panel button."""
+    await users_col.update_one(
+        {"_id": message.from_user.id},
+        {"$set": {"_id": message.from_user.id, "first_seen": datetime.now()}},
+        upsert=True
+    )
     buttons = InlineKeyboardMarkup([[InlineKeyboardButton("🛠 Open Admin Panel", callback_data="panel_open")]])
     await message.reply_text("👾", reply_markup=buttons)
 
@@ -216,6 +225,58 @@ async def panel_callback(client, callback_query):
             "✏️ Kaunsa message edit karna hai?", reply_markup=edit_msg_markup()
         )
 
+    if action == "debug":
+        config = await get_config()
+        total_users = await users_col.count_documents({})
+        total_tokens = await tokens_col.count_documents({})
+        active_tokens = await tokens_col.count_documents({"revoked": False, "expiry_time": {"$gt": datetime.now()}})
+        db_channel_id = await get_db_channel_id()
+        fsub_status = "Set ✅" if config.get("fsub_id") else "Not set ❌"
+        db_status = f"`{db_channel_id}`" if db_channel_id else "Not set ❌"
+
+        debug_text = (
+            f"🐞 **Debug Info**\n\n"
+            f"👥 Total users: `{total_users}`\n"
+            f"🔑 Total tokens (all time): `{total_tokens}`\n"
+            f"✅ Active tokens: `{active_tokens}`\n"
+            f"🗄 DB Channel: {db_status}\n"
+            f"📢 FSUB: {fsub_status}\n"
+            f"🔒 Content Protection: {'ON' if config.get('content_protection') else 'OFF'}\n"
+            f"🗑 Auto-Delete: {config.get('auto_delete_seconds', 0)}s\n"
+            f"⏱ Default Timer: `{config.get('default_timer', '1h')}`\n"
+        )
+        await callback_query.answer()
+        return await callback_query.message.reply_text(debug_text)
+
+    if action == "search":
+        now = datetime.now()
+        cursor = tokens_col.find({"revoked": False, "expiry_time": {"$gt": now}}).sort("expiry_time", 1)
+        lines = ["🔍 **Active Tokens:**\n"]
+        count = 0
+        async for t in cursor:
+            count += 1
+            used = t.get("used_count", 0)
+            limit = t.get("usage_limit")
+            limit_str = f"{used}/{limit}" if limit else f"{used}/∞"
+            remaining = t["expiry_time"] - now
+            hours_left = remaining.total_seconds() / 3600
+            lines.append(
+                f"`{t['token_id']}` — {len(t['files'])} files, used: {limit_str}, expires in {hours_left:.1f}h"
+            )
+        if count == 0:
+            lines.append("_Koi active token nahi hai._")
+        await callback_query.answer()
+        return await callback_query.message.reply_text("\n".join(lines))
+
+    if action == "broadcast":
+        buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("👥 Users ko bhejo", callback_data="bcast_users")],
+            [InlineKeyboardButton("📢 Channel(s) pe bhejo", callback_data="bcast_channels")],
+            [InlineKeyboardButton("🔙 Back", callback_data="panel_back")],
+        ])
+        await callback_query.answer()
+        return await callback_query.message.edit_text("📣 Broadcast kaha bhejna hai?", reply_markup=buttons)
+
     if action == "export":
         config = await get_config()
         config.pop("_id", None)
@@ -239,11 +300,12 @@ async def panel_callback(client, callback_query):
         "settimer": "⏱ Default token expiry time bhej (e.g. `1h`, `30m`, `1d`):",
         "autodelete": "🗑 Files kitni der baad auto-delete ho (e.g. `10m`, `1h`). Band karne ke liye `off` bhej:",
         "gentoken": (
-            "🔑 Format me bhej (ranges ya single numbers, space se separate, aakhir me naam):\n\n"
+            "🔑 Format me bhej (ranges ya single numbers, space se separate, naam, phir optional limit):\n\n"
             "**Single file:** `101 CuteGirl`\n"
             "**Range:** `101-112 CuteGirl`\n"
             "**Multi-range:** `4-8 20-25 VIP`\n"
-            "**Mix:** `4-8 15 20-25 VIP`"
+            "**Usage limit ke saath:** `4-8 20-25 VIP 50` (aakhri number = max 50 baar use hoga)\n\n"
+            "_Agar limit nahi doge to unlimited use hoga (jab tak expire na ho)._"
         ),
         "revoke": "❌ Jo token revoke karna hai uska naam bhej (e.g. `Roxie-CuteGirl`):",
     }
@@ -270,12 +332,83 @@ async def editmsg_callback(client, callback_query):
     )
 
 
+@app.on_callback_query(filters.regex(r"^bcast_") & filters.user(ADMIN_ID))
+async def bcast_callback(client, callback_query):
+    kind = callback_query.data.split("_", 1)[1]  # "users" ya "channels"
+    user_id = callback_query.from_user.id
+    back_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="panel_broadcast")]])
+
+    if kind == "users":
+        pending_action[user_id] = "awaiting_bcast_users"
+        await callback_query.answer()
+        return await callback_query.message.reply_text(
+            "👥 Jo message sabhi users ko bhejna hai wo type kar:", reply_markup=back_btn
+        )
+
+    elif kind == "channels":
+        config = await get_config()
+        channels = config.get("broadcast_channels", [])
+        if not channels:
+            pending_action[user_id] = "awaiting_addchannel"
+            await callback_query.answer()
+            return await callback_query.message.reply_text(
+                "📢 Abhi koi channel add nahi hai. Pehle channel ki ID bhej (e.g. `-1001234567890`):",
+                reply_markup=back_btn
+            )
+        pending_action[user_id] = "awaiting_bcast_channels"
+        await callback_query.answer()
+        return await callback_query.message.reply_text(
+            f"📢 {len(channels)} channel(s) me broadcast hoga. Message type kar.\n\n"
+            f"Naya channel add karne ke liye `/addchannel <id>` bhej pehle.",
+            reply_markup=back_btn
+        )
+
+
+@app.on_message(filters.command("addchannel") & filters.user(ADMIN_ID))
+async def add_broadcast_channel(client, message):
+    if len(message.command) < 2:
+        return await message.reply_text("Format: `/addchannel <channel_id>`")
+    channel_id = message.command[1]
+    try:
+        int(channel_id)
+    except ValueError:
+        return await message.reply_text("❌ Ye ID nahi lag rahi.")
+    config = await get_config()
+    channels = config.get("broadcast_channels", [])
+    if channel_id in channels:
+        return await message.reply_text("⚠️ Ye channel already list me hai.")
+    channels.append(channel_id)
+    await settings_col.update_one({"_id": "config"}, {"$set": {"broadcast_channels": channels}}, upsert=True)
+    await message.reply_text(f"✅ Channel add ho gaya. Total: {len(channels)}\n\n⚠️ Bot ko us channel me admin banana mat bhoolna.")
+
+
+@app.on_message(filters.command("search") & filters.user(ADMIN_ID))
+async def search_tokens_command(client, message):
+    now = datetime.now()
+    cursor = tokens_col.find({"revoked": False, "expiry_time": {"$gt": now}}).sort("expiry_time", 1)
+    lines = ["🔍 **Active Tokens:**\n"]
+    count = 0
+    async for t in cursor:
+        count += 1
+        used = t.get("used_count", 0)
+        limit = t.get("usage_limit")
+        limit_str = f"{used}/{limit}" if limit else f"{used}/∞"
+        remaining = t["expiry_time"] - now
+        hours_left = remaining.total_seconds() / 3600
+        lines.append(
+            f"`{t['token_id']}` — {len(t['files'])} files, used: {limit_str}, expires in {hours_left:.1f}h"
+        )
+    if count == 0:
+        lines.append("_Koi active token nahi hai._")
+    await message.reply_text("\n".join(lines))
+
+
 # ==========================================
 # 📩 ADMIN'S FOLLOW-UP REPLIES
 # ==========================================
 
 @app.on_message(filters.private & filters.text & filters.user(ADMIN_ID) & ~filters.command([
-    "start", "admin"
+    "start", "admin", "addchannel", "search"
 ]))
 async def handle_admin_pending(client, message):
     user_id = message.from_user.id
@@ -326,8 +459,16 @@ async def handle_admin_pending(client, message):
         if len(parts) < 2:
             return await message.reply_text("❌ Kam se kam ek number/range aur naam chahiye — dobara bhej.")
 
-        name = parts[-1]
-        range_parts = parts[:-1]
+        usage_limit = None
+        # Agar aakhri part pure number hai, wo usage limit hai (naam kabhi pura number nahi hota)
+        if parts[-1].isdigit() and len(parts) >= 3:
+            usage_limit = int(parts[-1])
+            name = parts[-2]
+            range_parts = parts[:-2]
+        else:
+            name = parts[-1]
+            range_parts = parts[:-1]
+
         file_ids, error = parse_ranges(range_parts)
         if error:
             return await message.reply_text(f"{error} — dobara bhej.")
@@ -346,12 +487,15 @@ async def handle_admin_pending(client, message):
                 "expiry_time": datetime.now() + timedelta(seconds=seconds),
                 "files": file_ids,
                 "revoked": False,
+                "usage_limit": usage_limit,
+                "used_count": 0,
             }},
             upsert=True
         )
+        limit_text = f"{usage_limit} uses" if usage_limit else "Unlimited"
         await message.reply_text(
             f"🔥 **Token Generated!**\n\n**Token:** `{token_id}`\n"
-            f"**Files:** {len(file_ids)}\n**Expires in:** {expiry_str}"
+            f"**Files:** {len(file_ids)}\n**Expires in:** {expiry_str}\n**Usage limit:** {limit_text}"
         )
 
     elif action == "awaiting_revoke":
@@ -388,6 +532,62 @@ async def handle_admin_pending(client, message):
             await message.reply_text("✅ Settings import ho gayi! `/admin` se check kar le.")
         except Exception as e:
             return await message.reply_text(f"❌ JSON parse nahi hua: {e}\nDobara sahi JSON bhej.")
+
+    elif action == "awaiting_bcast_users":
+        all_users = users_col.find({})
+        sent_count = 0
+        failed_count = 0
+        async for user in all_users:
+            try:
+                await client.send_message(user["_id"], text)
+                sent_count += 1
+                await asyncio.sleep(0.3)
+            except FloodWait as fw:
+                await asyncio.sleep(fw.value + 1)
+                try:
+                    await client.send_message(user["_id"], text)
+                    sent_count += 1
+                except Exception:
+                    failed_count += 1
+            except Exception:
+                failed_count += 1  # user ne bot block kiya ho sakta hai, ya deactivated ho
+        await message.reply_text(f"📣 Broadcast complete!\n✅ Sent: {sent_count}\n❌ Failed: {failed_count}")
+
+    elif action == "awaiting_bcast_channels":
+        config = await get_config()
+        channels = config.get("broadcast_channels", [])
+        sent_count = 0
+        failed_count = 0
+        for ch_id in channels:
+            try:
+                await client.send_message(int(ch_id), text)
+                sent_count += 1
+                await asyncio.sleep(0.5)
+            except FloodWait as fw:
+                await asyncio.sleep(fw.value + 1)
+                try:
+                    await client.send_message(int(ch_id), text)
+                    sent_count += 1
+                except Exception:
+                    failed_count += 1
+            except Exception as e:
+                failed_count += 1
+                await message.reply_text(f"⚠️ Channel `{ch_id}` me error: {e}")
+        await message.reply_text(f"📣 Broadcast complete!\n✅ Sent: {sent_count}\n❌ Failed: {failed_count}")
+
+    elif action == "awaiting_addchannel":
+        try:
+            int(text)
+        except ValueError:
+            return await message.reply_text("❌ Ye ID nahi lag rahi — dobara bhej.")
+        config = await get_config()
+        channels = config.get("broadcast_channels", [])
+        if text not in channels:
+            channels.append(text)
+            await settings_col.update_one({"_id": "config"}, {"$set": {"broadcast_channels": channels}}, upsert=True)
+        await message.reply_text(f"✅ Channel add ho gaya. Ab broadcast me message bhej.\n\n⚠️ Bot ko us channel me admin banana mat bhoolna.")
+        pending_action[user_id] = "awaiting_bcast_channels"
+        return
 
     pending_action.pop(user_id, None) if action not in ("awaiting_setfsub",) else None
 
@@ -427,6 +627,18 @@ async def send_batch(client, chat_id, token_data, offset):
             if auto_delete_seconds > 0:
                 asyncio.create_task(schedule_delete(client, chat_id, sent.id, auto_delete_seconds))
             await asyncio.sleep(0.7)
+        except FloodWait as fw:
+            # Telegram ne rate-limit lagaya - jitna bola utna wait karke retry karo
+            await asyncio.sleep(fw.value + 1)
+            try:
+                sent = await client.copy_message(
+                    chat_id=chat_id, from_chat_id=db_channel_id, message_id=msg_id,
+                    protect_content=protect
+                )
+                if auto_delete_seconds > 0:
+                    asyncio.create_task(schedule_delete(client, chat_id, sent.id, auto_delete_seconds))
+            except Exception as e:
+                await client.send_message(chat_id, f"⚠️ File ID {msg_id} bhejne me error (retry ke baad bhi): {e}")
         except Exception as e:
             await client.send_message(chat_id, f"⚠️ File ID {msg_id} bhejne me error: {e}")
 
@@ -465,6 +677,11 @@ async def next_batch_callback(client, callback_query):
 
 @app.on_message(filters.command("start") & filters.private & ~filters.user(ADMIN_ID))
 async def user_start(client, message):
+    await users_col.update_one(
+        {"_id": message.from_user.id},
+        {"$set": {"_id": message.from_user.id, "first_seen": datetime.now()}},
+        upsert=True
+    )
     config = await get_config()
     fsub_link = config.get("fsub_link")
 
@@ -511,6 +728,13 @@ async def handle_token_input(client, message):
 
     if not token_data or token_data.get("revoked") or datetime.now() > token_data["expiry_time"]:
         return await send_custom(client, message.chat.id, "invalid_token")
+
+    usage_limit = token_data.get("usage_limit")
+    used_count = token_data.get("used_count", 0)
+    if usage_limit is not None and used_count >= usage_limit:
+        return await message.reply_text("❌ Ye token apni usage limit tak pahuch chuka hai.")
+
+    await tokens_col.update_one({"token_id": token}, {"$inc": {"used_count": 1}})
 
     await send_custom(client, message.chat.id, "sending")
     await send_batch(client, message.chat.id, token_data, offset=0)
