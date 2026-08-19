@@ -1,4 +1,5 @@
 import os
+import json
 import asyncio
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -38,6 +39,19 @@ tokens_col = db["tokens"]
 
 PAGE_SIZE = 10
 pending_action = {}  # { user_id: "awaiting_xxx" }
+
+# ==========================================
+# 💬 DEFAULT CUSTOMIZABLE MESSAGES
+# Ye saare keys admin panel se edit ho sakte hain.
+# "extra" ek list hai - trigger pe in sabhi messages ko bhi bhejega (order me).
+# ==========================================
+DEFAULT_MESSAGES = {
+    "welcome": {"text": "🧑‍💻", "extra": []},
+    "verified": {"text": "🪪", "extra": []},
+    "sending": {"text": "📤", "extra": []},
+    "invalid_token": {"text": "❌", "extra": []},
+    "not_joined": {"text": "❌ Pehle channel join karo.", "extra": []},
+}
 
 
 # ==========================================
@@ -81,6 +95,50 @@ async def is_fsub_joined(client, user_id):
         return True  # fail-open agar bot admin nahi hai ya koi aur error
 
 
+async def get_message(key):
+    """Custom message uthata hai DB se, warna default use karta hai."""
+    config = await get_config()
+    custom = config.get("messages", {}).get(key)
+    if custom:
+        return custom
+    return DEFAULT_MESSAGES.get(key, {"text": "", "extra": []})
+
+
+async def send_custom(client, chat_id, key, reply_markup=None):
+    """Custom message + extras bhejta hai. Main text ka Message object return karta hai (edit ke liye)."""
+    msg_data = await get_message(key)
+    main = await client.send_message(chat_id, msg_data["text"], reply_markup=reply_markup)
+    for extra_text in msg_data.get("extra", []):
+        await client.send_message(chat_id, extra_text)
+        await asyncio.sleep(0.3)
+    return main
+
+
+# ==========================================
+# 🔢 MULTI-RANGE TOKEN PARSER
+# Format: "4-8 20-25 VIP" ya single file bhi: "4-8 15 VIP"
+# Aakhri part naam hai, baaki sab ranges/numbers hain.
+# ==========================================
+def parse_ranges(parts):
+    """Returns (file_ids_list, error_message_or_None)"""
+    file_ids = []
+    for part in parts:
+        if "-" in part:
+            bits = part.split("-")
+            if len(bits) != 2 or not (bits[0].isdigit() and bits[1].isdigit()):
+                return None, f"❌ `{part}` ek valid range nahi hai (format: start-end)."
+            start, end = int(bits[0]), int(bits[1])
+            if end < start:
+                return None, f"❌ `{part}` me end, start se chota hai."
+            file_ids.extend(range(start, end + 1))
+        elif part.isdigit():
+            file_ids.append(int(part))
+        else:
+            return None, f"❌ `{part}` samajh nahi aaya (number ya range hona chahiye)."
+    # Duplicates hata ke sorted order me rakho
+    return sorted(set(file_ids)), None
+
+
 # ==========================================
 # 🛠 ADMIN PANEL
 # ==========================================
@@ -96,8 +154,27 @@ async def admin_panel_markup():
         [InlineKeyboardButton("🔑 Generate Token", callback_data="panel_gentoken"),
          InlineKeyboardButton("❌ Revoke Token", callback_data="panel_revoke")],
         [InlineKeyboardButton(f"🔒 Content Protection: {protect_status}", callback_data="panel_toggleprotect")],
+        [InlineKeyboardButton("✏️ Edit Messages", callback_data="panel_editmsg")],
+        [InlineKeyboardButton("📤 Export Settings", callback_data="panel_export"),
+         InlineKeyboardButton("📥 Import Settings", callback_data="panel_import")],
         [InlineKeyboardButton("🚪 Quit", callback_data="panel_quit")],
     ])
+
+
+def edit_msg_markup():
+    keys = list(DEFAULT_MESSAGES.keys())
+    rows = []
+    for k in keys:
+        rows.append([InlineKeyboardButton(k, callback_data=f"editmsg_{k}")])
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="panel_back")])
+    return InlineKeyboardMarkup(rows)
+
+
+@app.on_message(filters.command("start") & filters.private & filters.user(ADMIN_ID))
+async def admin_start(client, message):
+    """Admin ke liye /start alag hai - seedha 👾 + panel button."""
+    buttons = InlineKeyboardMarkup([[InlineKeyboardButton("🛠 Open Admin Panel", callback_data="panel_open")]])
+    await message.reply_text("👾", reply_markup=buttons)
 
 
 @app.on_message(filters.command("admin") & filters.user(ADMIN_ID))
@@ -109,6 +186,11 @@ async def admin_panel(client, message):
 async def panel_callback(client, callback_query):
     action = callback_query.data.split("_", 1)[1]
     user_id = callback_query.from_user.id
+
+    if action == "open":
+        return await callback_query.message.edit_text(
+            "🛠 **Admin Panel** — neeche se option chuno:", reply_markup=await admin_panel_markup()
+        )
 
     if action == "quit":
         pending_action.pop(user_id, None)
@@ -129,6 +211,26 @@ async def panel_callback(client, callback_query):
             "🛠 **Admin Panel** — neeche se option chuno:", reply_markup=await admin_panel_markup()
         )
 
+    if action == "editmsg":
+        return await callback_query.message.edit_text(
+            "✏️ Kaunsa message edit karna hai?", reply_markup=edit_msg_markup()
+        )
+
+    if action == "export":
+        config = await get_config()
+        config.pop("_id", None)
+        json_str = json.dumps(config, indent=2, default=str)
+        await callback_query.answer()
+        return await callback_query.message.reply_text(f"📤 **Settings Export:**\n\n```json\n{json_str}\n```")
+
+    if action == "import":
+        pending_action[user_id] = "awaiting_import"
+        back_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="panel_back")]])
+        await callback_query.answer()
+        return await callback_query.message.reply_text(
+            "📥 Wo JSON paste karke bhej jo pehle export kiya tha:", reply_markup=back_btn
+        )
+
     back_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="panel_back")]])
 
     prompts = {
@@ -136,12 +238,36 @@ async def panel_callback(client, callback_query):
         "setdb": "🗄 DB channel ki ID bhej (e.g. `-1001234567890`):",
         "settimer": "⏱ Default token expiry time bhej (e.g. `1h`, `30m`, `1d`):",
         "autodelete": "🗑 Files kitni der baad auto-delete ho (e.g. `10m`, `1h`). Band karne ke liye `off` bhej:",
-        "gentoken": "🔑 Format me bhej:\n`<start_msg_id> <end_msg_id> <name>`\nExample: `101 112 CuteGirl`",
+        "gentoken": (
+            "🔑 Format me bhej (ranges ya single numbers, space se separate, aakhir me naam):\n\n"
+            "**Single file:** `101 CuteGirl`\n"
+            "**Range:** `101-112 CuteGirl`\n"
+            "**Multi-range:** `4-8 20-25 VIP`\n"
+            "**Mix:** `4-8 15 20-25 VIP`"
+        ),
         "revoke": "❌ Jo token revoke karna hai uska naam bhej (e.g. `Roxie-CuteGirl`):",
     }
     pending_action[user_id] = f"awaiting_{action}"
     await callback_query.answer()
     await callback_query.message.reply_text(prompts[action], reply_markup=back_btn)
+
+
+@app.on_callback_query(filters.regex(r"^editmsg_") & filters.user(ADMIN_ID))
+async def editmsg_callback(client, callback_query):
+    key = callback_query.data.split("_", 1)[1]
+    user_id = callback_query.from_user.id
+    pending_action[user_id] = f"awaiting_editmsg_{key}"
+    current = await get_message(key)
+    back_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="panel_editmsg")]])
+    await callback_query.answer()
+    await callback_query.message.reply_text(
+        f"✏️ **{key}** ka naya text bhej.\n\n"
+        f"Current: `{current['text']}`\n"
+        f"Extra messages: {len(current.get('extra', []))}\n\n"
+        f"Agar extra message bhi add karni hai to naya text ke baad `|||` daal ke likh:\n"
+        f"`MainText|||ExtraMsg1|||ExtraMsg2`",
+        reply_markup=back_btn
+    )
 
 
 # ==========================================
@@ -160,7 +286,6 @@ async def handle_admin_pending(client, message):
     text = message.text.strip()
 
     if action == "awaiting_setfsub":
-        # Pehle ID le rahe hain, phir link maangenge
         try:
             int(text)
         except ValueError:
@@ -198,21 +323,22 @@ async def handle_admin_pending(client, message):
 
     elif action == "awaiting_gentoken":
         parts = text.split()
-        if len(parts) < 3:
-            return await message.reply_text("❌ Format galat hai. Use: `<start_id> <end_id> <name>` — dobara bhej.")
-        start_raw, end_raw, name = parts[0], parts[1], parts[2]
-        if not (start_raw.isdigit() and end_raw.isdigit()):
-            return await message.reply_text("❌ start_id aur end_id number hone chahiye — dobara bhej.")
-        start_id, end_id = int(start_raw), int(end_raw)
-        if end_id < start_id:
-            return await message.reply_text("❌ end_id, start_id se chota nahi ho sakta — dobara bhej.")
+        if len(parts) < 2:
+            return await message.reply_text("❌ Kam se kam ek number/range aur naam chahiye — dobara bhej.")
+
+        name = parts[-1]
+        range_parts = parts[:-1]
+        file_ids, error = parse_ranges(range_parts)
+        if error:
+            return await message.reply_text(f"{error} — dobara bhej.")
+        if not file_ids:
+            return await message.reply_text("❌ Koi valid file ID nahi mili — dobara bhej.")
 
         config = await get_config()
         expiry_str = config.get("default_timer", "1h")
         seconds = parse_time(expiry_str) or 3600
 
         token_id = f"Roxie-{name}"
-        file_ids = list(range(start_id, end_id + 1))
         await tokens_col.update_one(
             {"token_id": token_id},
             {"$set": {
@@ -236,8 +362,34 @@ async def handle_admin_pending(client, message):
         else:
             await message.reply_text(f"✅ Token `{token_id}` revoke kar diya gaya.")
 
-    if action != "awaiting_setfsub":  # setfsub ke baad link ka wait chalu rehna chahiye
-        pending_action.pop(user_id, None)
+    elif action.startswith("awaiting_editmsg_"):
+        key = action.replace("awaiting_editmsg_", "")
+        bits = text.split("|||")
+        main_text = bits[0].strip()
+        extras = [b.strip() for b in bits[1:] if b.strip()]
+        config = await get_config()
+        messages = config.get("messages", {})
+        messages[key] = {"text": main_text, "extra": extras}
+        await settings_col.update_one({"_id": "config"}, {"$set": {"messages": messages}}, upsert=True)
+        await message.reply_text(f"✅ `{key}` update ho gaya.\nMain: {main_text}\nExtras: {len(extras)}")
+
+    elif action == "awaiting_import":
+        try:
+            cleaned = text.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.strip("`")
+                if cleaned.lower().startswith("json"):
+                    cleaned = cleaned[4:]
+            imported = json.loads(cleaned)
+            if not isinstance(imported, dict):
+                raise ValueError("JSON ek object hona chahiye")
+            imported["_id"] = "config"
+            await settings_col.replace_one({"_id": "config"}, imported, upsert=True)
+            await message.reply_text("✅ Settings import ho gayi! `/admin` se check kar le.")
+        except Exception as e:
+            return await message.reply_text(f"❌ JSON parse nahi hua: {e}\nDobara sahi JSON bhej.")
+
+    pending_action.pop(user_id, None) if action not in ("awaiting_setfsub",) else None
 
 
 # ==========================================
@@ -249,7 +401,7 @@ async def schedule_delete(client, chat_id, message_id, delay_seconds):
     try:
         await client.delete_messages(chat_id, message_id)
     except Exception:
-        pass  # message pehle hi delete ho chuki ho sakti hai
+        pass
 
 
 async def send_batch(client, chat_id, token_data, offset):
@@ -287,7 +439,8 @@ async def send_batch(client, chat_id, token_data, offset):
         await client.send_message(chat_id, f"({min(next_offset, total_files)}/{total_files} files sent)", reply_markup=buttons)
 
     if auto_delete_seconds > 0:
-        warn = await client.send_message(chat_id, f"⚠️ Ye files {auto_delete_seconds // 60 if auto_delete_seconds >= 60 else auto_delete_seconds}{'m' if auto_delete_seconds >= 60 else 's'} me delete ho jayengi, jaldi save kar lo.")
+        unit_label = f"{auto_delete_seconds // 60}m" if auto_delete_seconds >= 60 else f"{auto_delete_seconds}s"
+        await client.send_message(chat_id, f"⚠️ Ye files {unit_label} me delete ho jayengi, jaldi save kar lo.")
 
 
 @app.on_callback_query(filters.regex(r"^next_"))
@@ -307,11 +460,11 @@ async def next_batch_callback(client, callback_query):
 
 
 # ==========================================
-# 🚀 USER FLOW: /start -> 🧑‍💻 + Join/Verify -> 🪪 -> token -> 📤/❌
+# 🚀 USER FLOW (non-admin): /start -> welcome + Join/Verify -> verified -> token -> sending
 # ==========================================
 
-@app.on_message(filters.command("start") & filters.private)
-async def start(client, message):
+@app.on_message(filters.command("start") & filters.private & ~filters.user(ADMIN_ID))
+async def user_start(client, message):
     config = await get_config()
     fsub_link = config.get("fsub_link")
 
@@ -320,9 +473,9 @@ async def start(client, message):
             [InlineKeyboardButton("📢 Join Channel", url=fsub_link)],
             [InlineKeyboardButton("✅ Verify", callback_data="verify_fsub")],
         ])
-        return await message.reply_text("🧑‍💻", reply_markup=buttons)
+        return await send_custom(client, message.chat.id, "welcome", reply_markup=buttons)
 
-    await message.reply_text("🪪")
+    await send_custom(client, message.chat.id, "verified")
 
 
 @app.on_callback_query(filters.regex(r"^verify_fsub$"))
@@ -330,7 +483,10 @@ async def verify_fsub_callback(client, callback_query):
     user_id = callback_query.from_user.id
     if await is_fsub_joined(client, user_id):
         await callback_query.answer("✅ Verified!")
-        await callback_query.message.edit_text("🪪")
+        msg_data = await get_message("verified")
+        await callback_query.message.edit_text(msg_data["text"])
+        for extra_text in msg_data.get("extra", []):
+            await client.send_message(callback_query.message.chat.id, extra_text)
     else:
         await callback_query.answer("❌ Abhi bhi join nahi kiya hai. Pehle join kar.", show_alert=True)
 
@@ -349,14 +505,14 @@ async def handle_token_input(client, message):
                 [InlineKeyboardButton("📢 Join Channel", url=fsub_link)],
                 [InlineKeyboardButton("✅ Verify", callback_data="verify_fsub")],
             ])
-        return await message.reply_text("❌ Pehle channel join karo.", reply_markup=buttons)
+        return await send_custom(client, message.chat.id, "not_joined", reply_markup=buttons)
 
     token_data = await tokens_col.find_one({"token_id": token})
 
     if not token_data or token_data.get("revoked") or datetime.now() > token_data["expiry_time"]:
-        return await message.reply_text("❌")
+        return await send_custom(client, message.chat.id, "invalid_token")
 
-    await message.reply_text("📤")
+    await send_custom(client, message.chat.id, "sending")
     await send_batch(client, message.chat.id, token_data, offset=0)
 
 
